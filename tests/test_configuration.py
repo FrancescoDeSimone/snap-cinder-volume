@@ -2432,7 +2432,6 @@ def _ceph(name, pool, fsid=None):
         cfg["fsid"] = fsid
     return cfg
 
-
 def _base():
     return {
         "database": {"url": "sqlite://"},
@@ -2440,15 +2439,19 @@ def _base():
         "cinder": {"project-id": "p", "user-id": "u"},
     }
 
-
 FSID_A = "aaaaaaaa-0000-0000-0000-000000000000"
 FSID_B = "bbbbbbbb-0000-0000-0000-000000000000"
-
 
 class TestCephPoolUniqueness:
     @pytest.mark.parametrize(
         "fsid_1, fsid_2",
-        [(None, None), (FSID_A, FSID_A), (FSID_A, None), (None, FSID_A)],
+        [
+            (None, None),
+            (FSID_A, FSID_A),
+            (FSID_A, None),
+            (None, FSID_A),
+            (FSID_A, FSID_B),
+        ],
     )
     def test_same_pool_rejected(self, fsid_1, fsid_2):
         data = _base() | {
@@ -2457,15 +2460,75 @@ class TestCephPoolUniqueness:
         with pytest.raises(pydantic.ValidationError, match="Duplicate Ceph pool"):
             configuration.Configuration.model_validate(data)
 
-    def test_same_pool_on_different_clusters_allowed(self):
-        data = _base() | {
-            "ceph": {"a": _ceph("a", "vol", FSID_A), "b": _ceph("b", "vol", FSID_B)}
-        }
-        cfg = configuration.Configuration.model_validate(data)
-        assert cfg.ceph["b"].fsid == FSID_B
-
     def test_fsid_optional(self):
         cfg = configuration.Configuration.model_validate(
             _base() | {"ceph": {"a": _ceph("a", "vol")}}
         )
         assert cfg.ceph["a"].fsid is None
+
+class TestSharedBackendNames:
+    """Backends may share a volume_backend_name to be pooled by Cinder."""
+
+    @staticmethod
+    def _hitachi(name, san_ip):
+        return {
+            "volume-backend-name": name,
+            "san-ip": san_ip,
+            "san-login": "admin",
+            "san-password": "secret",
+            "hitachi-storage-id": "1",
+            "hitachi-pools": "pool",
+            "protocol": "iscsi",
+        }
+
+    @staticmethod
+    def _ceph(name, pool):
+        return {
+            "volume-backend-name": name,
+            "mon-hosts": "10.0.0.1",
+            "rbd-pool": pool,
+            "rbd-user": "cinder",
+            "rbd-secret-uuid": "uuid",
+            "rbd-key": "key",
+        }
+
+    @staticmethod
+    def _root(**backends):
+        return configuration.Configuration(
+            database={"url": "sqlite:///test.db"},
+            rabbitmq={"url": "amqp://localhost"},
+            cinder={"project-id": "project-id", "user-id": "user-id"},
+            **backends,
+        )
+
+    def test_same_type_backends_can_share_a_name(self):
+        """Two backends of one type may use the same volume_backend_name."""
+        config = self._root(
+            hitachi={
+                "be1": self._hitachi("pooled", "10.0.0.1"),
+                "be2": self._hitachi("pooled", "10.0.0.2"),
+            }
+        )
+
+        assert config.hitachi["be1"].volume_backend_name == "pooled"
+        assert config.hitachi["be2"].volume_backend_name == "pooled"
+
+    def test_different_type_backends_can_share_a_name(self):
+        """Backends of different types may share a volume_backend_name."""
+        config = self._root(
+            hitachi={"be1": self._hitachi("pooled", "10.0.0.1")},
+            ceph={"ceph1": self._ceph("pooled", "pool-a")},
+        )
+
+        assert config.hitachi["be1"].volume_backend_name == "pooled"
+        assert config.ceph["ceph1"].volume_backend_name == "pooled"
+
+    def test_ceph_backends_cannot_share_a_pool(self):
+        """A Ceph pool must still be used by at most one backend."""
+        with pytest.raises(pydantic.ValidationError, match="Duplicate Ceph pool"):
+            self._root(
+                ceph={
+                    "ceph1": self._ceph("name-a", "pool-a"),
+                    "ceph2": self._ceph("name-b", "pool-a"),
+                }
+            )
